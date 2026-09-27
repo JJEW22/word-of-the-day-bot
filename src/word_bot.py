@@ -1,200 +1,186 @@
-from discord import Client, MessageType, Intents, Message
-import os
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
-from english_processing import get_word_of_the_day, shortest_available_stem, is_word_candidate, get_word_candidate
 import asyncio
-
+import os
 import sys
+from datetime import datetime
+
+from discord import Client, Intents, Message, MessageType
+
+import store
+from adjudicate import adjudicate, to_est
+from english_processing import get_word_candidate, shortest_available_stem
+
 
 def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+    print(*args, file=sys.stderr, flush=True, **kwargs)
+
 
 token = os.environ['TOKEN']
 channel_id = int(os.environ['CHANNEL_ID'])
-blacklist_file = os.environ['BLACKLIST']
-whitelist_file = os.environ['WHITELIST']
 april_fools_link = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
-eastern_time_info = ZoneInfo('America/New_York')
-utc_info = timezone.utc
 
 APRIL_FOOLS = datetime(month=4, day=1, year=2025)
 
 EMOJI_ID = 1259346961627086918
+# get_emoji returns None when the bot shares no server with the custom emoji, and
+# add_reaction(None) raises. Falling back keeps a missing emoji from taking out the
+# whole approval path.
+FALLBACK_EMOJI = '✅'
 POLL_DURATION_HRS = 6
-POLL_VOTE_THRESHOLD = 5
 DISPUTE_MESSAGE = 'WRONG'
+
+YES_EMOJI = '✔️'
+NO_EMOJI = '❌'
 
 intents = Intents.default()
 intents.members = True
 intents.message_content = True
 
-class WordOfTheDayInfo:
-    def __init__(self, msg_id, user_id, timecode, full_message):
-        self.msg_id = msg_id
-        self.user_id = user_id
-        self.timecode = timecode
-        self.full_message = full_message
-
-def to_est(date: datetime) -> datetime:
-    if date.tzinfo is None:
-        date.tzinfo = utc_info
-    return date.astimezone(eastern_time_info)
 
 class WordBot(Client):
+    """Moderates the word-of-the-day channel.
 
-    def _determine_word_of_the_day(self, message: Message) -> str | WordOfTheDayInfo:
-        word = get_word_of_the_day(message.content, self._blacklist, self._whitelist)
-        if word is not None:
-            stem = shortest_available_stem(word)
+    State lives in Postgres (see store.py). It used to be an in-memory dict rebuilt
+    by replaying the entire channel in on_ready -- which fires again on every
+    reconnect, so a dropped websocket meant a full history re-scan. The channel is
+    now scanned once, by backfill.py.
+    """
 
-            if stem in self._words:
-                return self._words[stem]
-            else:
-                return stem
-            
-    def _already_posted_on(self, date_time, user) -> bool:
-        for v in self._words.values():
-            if v.user_id == user and date_time.date() == v.timecode.date():
-                return True
-        return False
-                
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._started = False
+        self._rulings = {}
+
+    async def _refresh_rulings(self):
+        """stem -> 'valid' | 'invalid', as settled by the WRONG polls."""
+        self._rulings = await store.rulings()
+
     async def on_ready(self):
-        self._words = {}
-        self._blacklist = [str(line) for line in open(blacklist_file, 'w+')]
-        self._whitelist = [str(line) for line in open(whitelist_file, 'w+')]
-        wotd_channel = self.get_channel(channel_id)
-        async for message in wotd_channel.history(limit=None, oldest_first=True):
-            if message.author != self.user.id and message.type == MessageType.default:
-                res = self._determine_word_of_the_day(message)
-                if type(res) is str:
-                    timecode = to_est(message.created_at)
-                    if not self._already_posted_on(timecode, message.author.id):
-                        self._words[res] = WordOfTheDayInfo(message.id, message.author.id, timecode, message.content)
-                        await self.add_reaction(message)
-                    else:
-                        await self.remove_reaction(message)
-                else:
-                    await self.remove_reaction(message)
-        eprint("Finished parsing previous messages and setting up.")
+        # on_ready fires on every reconnect, not just at startup.
+        if self._started:
+            return
+        self._started = True
+        await self._refresh_rulings()
+        valid = sum(1 for v in self._rulings.values() if v == store.VALID)
+        eprint('ready: {} rulings ({} valid, {} invalid)'.format(
+            len(self._rulings), valid, len(self._rulings) - valid))
+
+    def _emoji(self):
+        return self.get_emoji(EMOJI_ID) or FALLBACK_EMOJI
 
     async def on_message(self, message: Message):
-        if message.author.id == self.user.id or message.channel.id != channel_id: #only want wotd channel and non bot messages
+        # This channel only, and never our own messages.
+        if message.author.id == self.user.id or message.channel.id != channel_id:
             return
-        
+
         if message.type == MessageType.reply:
             if message.content == DISPUTE_MESSAGE:
-                await self.dispute_word(await message.channel.fetch_message(message.reference.message_id), message)
+                disputed = await message.channel.fetch_message(message.reference.message_id)
+                await self.dispute_word(disputed, message)
+            return
 
-        elif message.type == MessageType.default:
-            print(message.content)
-            
-            res = self._determine_word_of_the_day(message)
+        if message.type != MessageType.default:
+            return
 
-            if type(res) is str:
-                print('new word of the day: {}'.format(message.content))
-                timecode = to_est(message.created_at)
-                if res:
-                    if self._already_posted_on(timecode, message.author.id):
-                        await message.reply("Only one word of the day per day, bozo 💀")
-                    else:
-                        self._words[res] = WordOfTheDayInfo(message.id, message.author.id, timecode, message.content)
-                        await message.add_reaction(self.get_emoji(EMOJI_ID))
+        decision = await adjudicate(
+            message.id, message.author.id, message.content, message.created_at, self._rulings)
 
-                        if timecode.date() == APRIL_FOOLS.date():
-                            await message.reply(":bangbang:Recycled word alert:bangbang:\n {} already said [{}](<{}>)"
-                                        .format(message.author.mention, message.content, april_fools_link))
-            elif res is not None:
-                original_message = await message.channel.fetch_message(res.msg_id)
-                await message.reply(":bangbang:Recycled word alert:bangbang:\n {} already said [{}]({})"
-                                        .format(original_message.author.mention, original_message.content, original_message.jump_url))
-                
+        if decision.status == store.ACCEPTED:
+            await message.add_reaction(self._emoji())
+            if to_est(message.created_at).date() == APRIL_FOOLS.date():
+                await message.reply(
+                    ':bangbang:Recycled word alert:bangbang:\n {} already said [{}](<{}>)'
+                    .format(message.author.mention, message.content, april_fools_link))
+
+        elif decision.status == store.RECYCLED:
+            original = await message.channel.fetch_message(decision.original['message_id'])
+            await message.reply(
+                ':bangbang:Recycled word alert:bangbang:\n {} already said [{}]({})'
+                .format(original.author.mention, original.content, original.jump_url))
+
+        elif decision.status == store.DUPLICATE_DAY:
+            await message.reply('Only one word of the day per day, bozo 💀')
+
+        # INVALID and None draw no response, as before: the bot stays quiet about
+        # things that were never plausible words of the day.
+
     async def on_message_edit(self, before, after):
         await self.remove_wotd(before)
         await self.on_message(after)
 
     async def on_raw_message_delete(self, message_event):
-        for word, wotd_info in self._words.items():
-            if wotd_info.msg_id == message_event.message_id:
-                await self.get_channel(channel_id).send("{} deleted their word of the day \"{}\"! Kinda embarrassing, not gonna lie... 💀"
-                                           .format(self.get_user(wotd_info.user_id).mention, wotd_info.full_message))
-                self._words.pop(word)
+        # One lookup rather than scanning a dict -- and crucially not mutating that
+        # dict mid-iteration, which is what made the old version raise
+        # "dictionary changed size during iteration" every time a word was deleted.
+        gone = await store.forget(message_event.message_id)
+        if gone is None or gone['status'] != store.ACCEPTED:
+            return
+        user = self.get_user(gone['user_id'])
+        who = user.mention if user is not None else '<@{}>'.format(gone['user_id'])
+        await self.get_channel(channel_id).send(
+            '{} deleted their word of the day "{}"! Kinda embarrassing, not gonna lie... 💀'
+            .format(who, gone['raw_message']))
 
     async def remove_wotd(self, msg, deleted=False):
-        for key, wotd_info in self._words.items():
-            if wotd_info.msg_id == msg.id:
-                self._words.pop(key)
-                if not deleted:
-                    await self.remove_reaction(msg)
-                return
-            
+        gone = await store.forget(msg.id)
+        if gone is not None and not deleted:
+            await self.remove_reaction(msg)
+
     async def remove_reaction(self, msg):
         for reaction in msg.reactions:
             if reaction.me:
                 await reaction.remove(self.user)
 
     async def add_reaction(self, msg):
-        added = False
         for reaction in msg.reactions:
             if reaction.me:
-                added = True
-                break
-        if not added:
-            await msg.add_reaction(self.get_emoji(EMOJI_ID))
-                
+                return
+        await msg.add_reaction(self._emoji())
+
     async def dispute_word(self, msg: Message, dispute_msg: Message):
-        dispute_text = "{} has thrown down the gauntlet 😱😱\nIs **{}** an acceptable word of the day?".format(dispute_msg.author.mention, msg.content)
+        dispute_text = '{} has thrown down the gauntlet 😱😱\nIs **{}** an acceptable word of the day?'.format(
+            dispute_msg.author.mention, msg.content)
         word = get_word_candidate(msg.content)
         if word is None:
-            await dispute_msg.reply("bot abuser 😱")
+            await dispute_msg.reply('bot abuser 😱')
             return
-        poll = await msg.reply("{}\nHours to close: {}"
-                               .format(dispute_text, POLL_DURATION_HRS))
-        await poll.add_reaction('✔️')
-        await poll.add_reaction('❌')
+
+        poll = await msg.reply('{}\nHours to close: {}'.format(dispute_text, POLL_DURATION_HRS))
+        await poll.add_reaction(YES_EMOJI)
+        await poll.add_reaction(NO_EMOJI)
         for i in range(1, POLL_DURATION_HRS + 1):
             await asyncio.sleep(3600)
-            await poll.edit(content="{}\nHours to close: {}"
-                               .format(dispute_text, POLL_DURATION_HRS - i))
+            await poll.edit(content='{}\nHours to close: {}'.format(dispute_text, POLL_DURATION_HRS - i))
+
         completed_poll = await msg.channel.fetch_message(poll.id)
         yes_count = 0
         no_count = 0
         for reaction in completed_poll.reactions:
-            if reaction.emoji == '✔️':
-                yes_count = reaction.count - 1
-            elif reaction.emoji == '❌':
+            if reaction.emoji == YES_EMOJI:
+                yes_count = reaction.count - 1   # less the bot's own seed reaction
+            elif reaction.emoji == NO_EMOJI:
                 no_count = reaction.count - 1
-        
-        poll_close_message = ""
-        
-        stem = shortest_available_stem(word)
-        if yes_count > no_count:
-            self._whitelist.append(stem)
-            if stem in self._blacklist:
-                self._blacklist.remove(stem) #make sure to clear it from the other list if it was on it
-            poll_close_message = "THE PEOPLE HAVE SPOKEN 😤\nTHIS WORD HAS BEEN DEEMED **VALID**!!"
-        else: 
-            self._blacklist.append(stem)
-            if stem in self._whitelist:
-                self._whitelist.remove(stem)
-            poll_close_message = "THE PEOPLE HAVE SPOKEN 😤\nTHIS WORD HAS BEEN DEEMED **INVALID**!!"
-        await completed_poll.reply(poll_close_message)
-        self.write_white_blacklists()
-        await completed_poll.edit(content="{}\nPOLL HAS CLOSED.\nVotes YAY: {}\nVotes NAY: {}"
-                               .format(dispute_text, yes_count, no_count))
-        await self.remove_wotd(msg)
-        await self.remove_reaction(msg)
-        await self.on_message(msg)
-        
-    def write_white_blacklists(self):
-        with open(blacklist_file, mode='wt', encoding='utf-8') as blfile:
-            blfile.write('\n'.join(self._blacklist))
-        with open(whitelist_file, mode='wt', encoding='utf-8') as wlfile:
-            wlfile.write('\n'.join(self._whitelist))
 
-                
-client = WordBot(intents=intents)
-client.run(token)
-            
-        
-        
+        stem = shortest_available_stem(word)
+        verdict = store.VALID if yes_count > no_count else store.INVALID_RULING
+        # One row per stem carrying a verdict, so a re-poll just moves the word
+        # between valid and invalid. No pair of lists to fall out of step, and it
+        # survives a restart -- which the old flat files never did.
+        await store.set_ruling(stem, verdict, poll.id, yes_count, no_count)
+        await self._refresh_rulings()
+
+        await completed_poll.reply(
+            'THE PEOPLE HAVE SPOKEN 😤\nTHIS WORD HAS BEEN DEEMED **{}**!!'
+            .format('VALID' if verdict == store.VALID else 'INVALID'))
+        await completed_poll.edit(content='{}\nPOLL HAS CLOSED.\nVotes YAY: {}\nVotes NAY: {}'
+                                  .format(dispute_text, yes_count, no_count))
+
+        # Re-judge the disputed message under the new ruling.
+        await self.remove_wotd(msg)
+        await self.on_message(msg)
+
+    async def close(self):
+        await store.close()
+        await super().close()
+
+
+WordBot(intents=intents).run(token)
