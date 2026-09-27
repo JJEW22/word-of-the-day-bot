@@ -4,7 +4,9 @@ import sys
 from datetime import datetime
 
 from discord import Client, Intents, Message, MessageType
+from discord import app_commands
 
+import wod_commands
 import store
 from adjudicate import adjudicate, to_est
 from english_processing import get_word_candidate, shortest_available_stem
@@ -49,6 +51,10 @@ class WordBot(Client):
         super().__init__(**kwargs)
         self._started = False
         self._rulings = {}
+        # discord.Client has no command tree of its own (that's commands.Bot), so
+        # the tree is built here and the commands registered onto it.
+        self.tree = app_commands.CommandTree(self)
+        wod_commands.register(self.tree)
 
     async def _refresh_rulings(self):
         """stem -> 'valid' | 'invalid', as settled by the WRONG polls."""
@@ -64,6 +70,43 @@ class WordBot(Client):
         eprint('ready: {} rulings ({} valid, {} invalid)'.format(
             len(self._rulings), valid, len(self._rulings) - valid))
 
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except Exception as err:
+                eprint('could not fetch channel {}: {}'.format(channel_id, err))
+        guild = getattr(channel, 'guild', None)
+        if guild is None:
+            eprint('WARNING: channel {} not visible; commands not synced'.format(channel_id))
+            return
+
+        await self._refresh_names(guild)
+
+        # Synced to the ONE guild rather than globally: a guild sync is available
+        # immediately, while a global one can take up to an hour to propagate.
+        self.tree.copy_global_to(guild=guild)
+        synced = await self.tree.sync(guild=guild)
+        eprint('synced {} command(s) to {}: {}'.format(
+            len(synced), guild.name, ', '.join(c.name for c in synced)))
+
+    async def _refresh_names(self, guild):
+        """Store every member's current display name, for the website.
+
+        Discord needs none of this -- a <@id> mention always renders the live name.
+        The website cannot resolve an id, so it reads wod_users instead, and this
+        keeps it honest across nickname changes. Runs on every startup; on_message
+        keeps active people current in between.
+        """
+        stored = 0
+        try:
+            async for member in guild.fetch_members(limit=None):
+                await store.upsert_user(member.id, member.display_name)
+                stored += 1
+        except Exception as err:
+            eprint('name refresh failed ({}); names may be stale on the website'.format(err))
+        eprint('refreshed {} display names'.format(stored))
+
     def _emoji(self):
         return self.get_emoji(EMOJI_ID) or FALLBACK_EMOJI
 
@@ -71,6 +114,9 @@ class WordBot(Client):
         # This channel only, and never our own messages.
         if message.author.id == self.user.id or message.channel.id != channel_id:
             return
+
+        # Cheap, and it means a rename shows on the website before the next restart.
+        await store.upsert_user(message.author.id, message.author.display_name)
 
         if message.type == MessageType.reply:
             if message.content == DISPUTE_MESSAGE:
@@ -183,4 +229,5 @@ class WordBot(Client):
         await super().close()
 
 
-WordBot(intents=intents).run(token)
+if __name__ == '__main__':
+    WordBot(intents=intents).run(token)

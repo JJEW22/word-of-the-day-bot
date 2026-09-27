@@ -159,3 +159,50 @@ async def set_ruling(stem: str, verdict: str, poll_message_id: Optional[int] = N
                no_count        = excluded.no_count,
                decided_at      = excluded.decided_at""",
         stem, verdict, poll_message_id, yes_count, no_count)
+
+
+# ---------- display names ----------
+
+async def upsert_user(user_id: int, display_name: str) -> None:
+    """Remember what someone is currently called.
+
+    Only for the website, which cannot resolve a Discord id. Discord itself is
+    told nothing -- a <@id> mention renders the live name, so anything shown in
+    Discord is never stale by construction.
+    """
+    pool = await connect()
+    await pool.execute(
+        """insert into wod_users (user_id, display_name, updated_at)
+           values ($1, $2, now())
+           on conflict (user_id) do update
+               set display_name = excluded.display_name, updated_at = now()
+           where wod_users.display_name <> excluded.display_name""",
+        user_id, display_name)
+
+
+# ---------- stats (all the arithmetic lives in sql/018_wod_stats.sql) ----------
+
+async def server_stats():
+    pool = await connect()
+    return await pool.fetchrow('select * from wod_server_stats')
+
+
+async def leaderboard(limit: int = 25):
+    pool = await connect()
+    return await pool.fetch('select * from wod_leaderboard order by rank limit $1', limit)
+
+
+async def user_stats(user_id: int):
+    pool = await connect()
+    return await pool.fetchrow(
+        """select l.* from wod_leaderboard l where l.user_id = $1""", user_id)
+
+
+async def nemesis(user_id: int):
+    """Who has stolen the most words from this person."""
+    pool = await connect()
+    return await pool.fetchrow(
+        """select thief_id, times from wod_plagiarist_pairs
+           where victim_id = $1 and thief_id <> victim_id
+           order by times desc, thief_id limit 1""",
+        user_id)
