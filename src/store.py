@@ -63,7 +63,8 @@ async def accepted_for_stem(stem: str) -> Optional[asyncpg.Record]:
 
 async def record(message_id: int, user_id: int, raw_message: str, word: Optional[str],
                  stem: Optional[str], posted_at, status: str,
-                 recycled_of: Optional[int] = None) -> None:
+                 recycled_of: Optional[int] = None,
+                 from_dictionary: Optional[bool] = None) -> None:
     """Write one submission attempt.
 
     Keyed on Discord's message_id, so re-running the backfill over a channel updates
@@ -72,17 +73,20 @@ async def record(message_id: int, user_id: int, raw_message: str, word: Optional
     pool = await connect()
     await pool.execute(
         """insert into wod_submissions
-               (message_id, user_id, raw_message, word, stem, posted_at, status, recycled_of)
-           values ($1, $2, $3, $4, $5, $6, $7, $8)
+               (message_id, user_id, raw_message, word, stem, posted_at, status,
+                recycled_of, from_dictionary)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            on conflict (message_id) do update set
-               user_id     = excluded.user_id,
-               raw_message = excluded.raw_message,
-               word        = excluded.word,
-               stem        = excluded.stem,
-               posted_at   = excluded.posted_at,
-               status      = excluded.status,
-               recycled_of = excluded.recycled_of""",
-        message_id, user_id, raw_message, word, stem, posted_at, status, recycled_of)
+               user_id         = excluded.user_id,
+               raw_message     = excluded.raw_message,
+               word            = excluded.word,
+               stem            = excluded.stem,
+               posted_at       = excluded.posted_at,
+               status          = excluded.status,
+               recycled_of     = excluded.recycled_of,
+               from_dictionary = excluded.from_dictionary""",
+        message_id, user_id, raw_message, word, stem, posted_at, status, recycled_of,
+        from_dictionary)
 
 
 async def try_accept(message_id: int, user_id: int, raw_message: str, word: str,
@@ -137,28 +141,34 @@ async def forget(message_id: int) -> Optional[asyncpg.Record]:
 # ---------- dispute rulings ----------
 
 async def rulings() -> dict:
-    """stem -> 'valid' | 'invalid', for every word a poll has settled."""
+    """word -> 'valid' | 'invalid', for every word a poll has settled.
+
+    Keyed by the WORD, not its stem. A downvote judges one word, so it must
+    not spread across the family: rejecting `swashbuckle` cannot take
+    `swashbuckler` with it, and `nutcrack` must not invalidate `nutcracker`.
+    Dedup still runs on the stem -- a different question entirely.
+    """
     pool = await connect()
-    rows = await pool.fetch('select stem, verdict from wod_word_rulings')
-    return {r['stem']: r['verdict'] for r in rows}
+    rows = await pool.fetch('select word, verdict from wod_word_rulings')
+    return {r['word']: r['verdict'] for r in rows}
 
 
-async def set_ruling(stem: str, verdict: str, poll_message_id: Optional[int] = None,
+async def set_ruling(word: str, verdict: str, poll_message_id: Optional[int] = None,
                      yes_count: Optional[int] = None, no_count: Optional[int] = None) -> None:
-    """Record a poll outcome. Re-polling the same word overwrites the old verdict,
-    which is also what moves a stem between the two lists."""
+    """Record a poll outcome against the WORD. Re-polling it overwrites the old
+    verdict, which is what moves that word between allowed and disallowed."""
     pool = await connect()
     await pool.execute(
         """insert into wod_word_rulings
-               (stem, verdict, poll_message_id, yes_count, no_count, decided_at)
+               (word, verdict, poll_message_id, yes_count, no_count, decided_at)
            values ($1, $2, $3, $4, $5, now())
-           on conflict (stem) do update set
+           on conflict (word) do update set
                verdict         = excluded.verdict,
                poll_message_id = excluded.poll_message_id,
                yes_count       = excluded.yes_count,
                no_count        = excluded.no_count,
                decided_at      = excluded.decided_at""",
-        stem, verdict, poll_message_id, yes_count, no_count)
+        word, verdict, poll_message_id, yes_count, no_count)
 
 
 # ---------- display names ----------
@@ -206,3 +216,89 @@ async def nemesis(user_id: int):
            where victim_id = $1 and thief_id <> victim_id
            order by times desc, thief_id limit 1""",
         user_id)
+
+
+# ---------- chronology ----------
+#
+# A dispute poll runs for six hours, so a word can be judged long after it was
+# posted. Precedence must follow WHEN IT WAS POSTED, not when the verdict landed --
+# otherwise winning an appeal could leave your earlier word marked as the copy of
+# someone else's later one.
+
+async def accepted_for_stem_before(stem: str, before) -> Optional[asyncpg.Record]:
+    """The submission holding this stem that was posted EARLIER than `before`.
+
+    Only an earlier claim makes you the copy. A later one means you were first and
+    it is theirs that has to give way -- see claim_stem.
+    """
+    pool = await connect()
+    return await pool.fetchrow(
+        """select message_id, user_id, raw_message, word, stem, posted_at
+           from wod_submissions
+           where stem = $1 and status = $2 and posted_at < $3""",
+        stem, ACCEPTED, before)
+
+
+async def posted_on_before(user_id: int, day: date, before) -> bool:
+    """Did this person already have a word accepted EARLIER on this (Eastern) day?"""
+    pool = await connect()
+    row = await pool.fetchrow(
+        """select 1 from wod_submissions
+           where user_id = $1 and status = $2
+             and (posted_at at time zone 'America/New_York')::date = $3
+             and posted_at < $4
+           limit 1""",
+        user_id, ACCEPTED, day, before)
+    return row is not None
+
+
+async def claim_stem(message_id: int, user_id: int, raw_message: str, word: str,
+                     stem: str, posted_at,
+                     from_dictionary: Optional[bool] = None) -> Optional[asyncpg.Record]:
+    """Take the stem, displacing a LATER holder if there is one.
+
+    Returns None on success, or the submission that legitimately got there first.
+
+    One transaction, because three rows can move together: a later holder gets
+    demoted to `recycled`, anything that was pointing at that holder as the
+    original is repointed here, and this row becomes accepted. Leaving a
+    `recycled_of` aimed at a row that is no longer accepted would break the
+    plagiarism links the bot quotes.
+    """
+    pool = await connect()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            holder = await conn.fetchrow(
+                """select message_id, user_id, raw_message, word, stem, posted_at
+                   from wod_submissions
+                   where stem = $1 and status = $2 for update""",
+                stem, ACCEPTED)
+
+            if holder is not None and holder['message_id'] != message_id:
+                if holder['posted_at'] <= posted_at:
+                    return holder          # genuinely first; caller is the copy
+                # We were first. Their claim yields, and every repeat that pointed
+                # at them now points at us.
+                await conn.execute(
+                    'update wod_submissions set recycled_of = $1 where recycled_of = $2',
+                    message_id, holder['message_id'])
+                await conn.execute(
+                    """update wod_submissions
+                       set status = $1, recycled_of = $2
+                       where message_id = $3""",
+                    RECYCLED, message_id, holder['message_id'])
+
+            await conn.execute(
+                """insert into wod_submissions
+                       (message_id, user_id, raw_message, word, stem, posted_at, status,
+                        recycled_of, from_dictionary)
+                   values ($1, $2, $3, $4, $5, $6, $7, null, $8)
+                   on conflict (message_id) do update set
+                       user_id = excluded.user_id, raw_message = excluded.raw_message,
+                       word = excluded.word, stem = excluded.stem,
+                       posted_at = excluded.posted_at, status = excluded.status,
+                       recycled_of = null,
+                       from_dictionary = excluded.from_dictionary""",
+                message_id, user_id, raw_message, word, stem, posted_at, ACCEPTED,
+                from_dictionary)
+            return None

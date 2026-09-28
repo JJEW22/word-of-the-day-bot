@@ -40,28 +40,87 @@ def _fmt_leaderboard(rows) -> str:
     return '```\n' + '\n'.join(lines) + '\n```'
 
 
+def _fmt_channel(s) -> str:
+    """The channel-wide block: one stat per line, day-based figures first.
+
+    A single stacked list rather than side-by-side inline fields, because Discord
+    reflows inline fields into columns differently on mobile and desktop -- stacked
+    is the only layout that reads the same everywhere.
+    """
+    # The dictionary lines sit right under the word count, and are dropped entirely
+    # if count_dictionary.py has never run. Better a shorter block than a confident
+    # "0.00% used".
+    dictionary = ''
+    if s['dictionary_stems']:
+        dictionary = ('% of the dictionary used: **{}%**\n'
+                      'Words left to claim: **{:,}**\n'
+                      ).format(s['pct_dictionary_used'], s['words_remaining'])
+
+    # "Twice in a day" isn't strictly one of the requested stats, but without it the
+    # four sub-categories don't sum to the stated total and the block looks wrong.
+    return ('Days running: **{:,}**\n'
+            'Days with a word: **{:,}**\n'
+            '% of days with a word: **{}%**\n'
+            'Total words: **{:,}**\n'
+            '{}'
+            'Total errors: **{:,}**\n'
+            'Plagiarisms: **{:,}**\n'
+            'Self-cites: **{:,}**\n'
+            'Twice in a day: **{:,}**\n'
+            'Disallowed words: **{:,}**\n'
+            'Accuracy: **{}%**'
+            ).format(s['days_running'], s['active_days'], s['pct_days_with_word'],
+                     s['accepted'], dictionary, s['errors'], s['total_thefts'],
+                     s['total_self_recycles'], s['duplicate_day'],
+                     s['invalid'], s['accuracy_pct'])
+
+
 def register(tree: app_commands.CommandTree) -> None:
     @tree.command(name='leaderboard',
-                  description='Who is on the best errorless run')
+                  description='Channel stats, records and the standings')
     async def leaderboard(interaction: discord.Interaction):
         # Defer first: Discord gives an interaction 3 seconds, and a cold Neon
         # connection can eat most of that on its own.
         await interaction.response.defer()
-        rows = await store.leaderboard()
-        stats = await store.server_stats()
+        rows = await store.leaderboard(limit=25)
+        s = await store.server_stats()
 
-        blurb = (
+        e = discord.Embed(title='🏆 Word of the Day', colour=0xFEE75C)
+
+        # The table goes in the DESCRIPTION, not a field: field values cap at 1024
+        # characters, which 25 rows would overflow. Descriptions allow 4096.
+        e.description = (
             'Ranked by **errorless days in a row**. Ties go to the sum of the other '
             'two streaks, then to total words.\n'
-            '**Clean** = errorless days in a row · **Day** = days in a row with a word · '
-            '**Run** = accepted words since your last mistake\n'
+            '**Clean** = errorless days running · **Day** = days running with a word · '
+            '**Run** = words since your last mistake\n'
+            + _fmt_leaderboard(rows)
         )
-        records = (
-            '\nAll-time records - clean days: **{}** · days: **{}** · clean run: **{}**'
-            .format(stats['record_clean_day_streak'], stats['record_day_streak'],
-                    stats['record_clean_run'])
-        )
-        await interaction.followup.send(blurb + _fmt_leaderboard(rows) + records)
+
+        # One stat per line, in a single non-inline field. Side-by-side inline
+        # fields would column these up and Discord reflows them differently on
+        # mobile, so a stacked list is the only layout that reads the same
+        # everywhere. Day-based figures lead, since the third is the ratio of the
+        # first two.
+        #
+        # "Twice in a day" isn't in the requested list, but without it the four
+        # sub-categories sum to 1,442 against a stated 1,652 total -- the 210 has
+        # to appear somewhere or the breakdown looks wrong.
+        e.add_field(name='The channel', value=_fmt_channel(s), inline=False)
+
+        # Mentions, not the stored names: they render inside an embed and always
+        # show what someone is called right now.
+        e.add_field(
+            name='All-time records',
+            value=('Errorless days: **{}** — <@{}>\n'
+                   'Days running: **{}** — <@{}>\n'
+                   'Clean run: **{}** — <@{}>'
+                   ).format(s['record_clean_day_streak'], s['record_clean_day_user_id'],
+                            s['record_day_streak'], s['record_day_user_id'],
+                            s['record_clean_run'], s['record_clean_run_user_id']),
+            inline=False)
+
+        await interaction.followup.send(embed=e)
 
     @tree.command(name='stats', description='Someone\'s word-of-the-day record')
     @app_commands.describe(user='Whose stats to show. Leave empty for your own.')
@@ -85,6 +144,11 @@ def register(tree: app_commands.CommandTree) -> None:
             name='Words',
             value='**{}** accepted of {} submitted\n{}% stuck'.format(
                 row['accepted'], row['submitted'], row['accuracy_pct']),
+            inline=True)
+        e.add_field(
+            name='Turnout',
+            value='A word on **{}%** of days\n{} of {} days since your first'.format(
+                row['submission_rate_pct'], row['accepted_days'], row['days_since_first']),
             inline=True)
         e.add_field(
             name='Mistakes',
